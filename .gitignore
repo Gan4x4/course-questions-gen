@@ -5,6 +5,6 @@ __pycache__/
 .pytest_cache/
 AGENTS.md
 .vscode/
-graph.png
+graph.mmd
 src/course_questions_gen.egg-info/
 requirements/
