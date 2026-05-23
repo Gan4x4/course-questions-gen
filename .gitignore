@@ -3,3 +3,8 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+AGENTS.md
+.vscode/
+graph.png
+src/course_questions_gen.egg-info/
+requirements/
