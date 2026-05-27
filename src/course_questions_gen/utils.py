@@ -20,5 +20,6 @@ def create_default_context() -> GraphContext:
     return GraphContext(
         llm=llm,
         prompts=prompts,
+        question_count = config.getint("extra", "question_count")
     )
 

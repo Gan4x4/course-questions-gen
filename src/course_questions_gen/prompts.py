@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import os
-from configparser import ConfigParser
-from dataclasses import dataclass, fields
-from functools import lru_cache
+import csv
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import get_type_hints
 
@@ -13,11 +11,11 @@ from langchain_core.prompts import PromptTemplate
 
 # ============================ Prompts =============================================
 
-@dataclass(frozen=True)
-class PromptSettings:
-    prompts_dir: Path
-    openai_model: str = "gpt-4o"
-    openai_proxy: str | None = None
+#@dataclass(frozen=True)
+#class PromptSettings:
+#    prompts_dir: Path
+#    openai_model: str = "gpt-4o"
+#    openai_proxy: str | None = None
 
 
 @dataclass(frozen=True)
@@ -29,6 +27,7 @@ class ContentExpertPrompts:
 @dataclass(frozen=True)
 class SharedPrompts:
     question_format: PromptTemplate
+    question_csv_header: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -43,7 +42,22 @@ def load_prompts(root: Path) -> Prompts:
         Every agents prompt sit in it's subdir
     
     """
-    return _load_prompt_group(root, Prompts)
+    root = Path(root)
+    prompts = _load_prompt_group(root, Prompts)
+    header = load_csv_header(root / "shared" / "question_template.csv")
+
+    shared = SharedPrompts(
+        question_format=prompts.shared.question_format.partial(
+            question_csv_header=",".join(header),
+        ),
+        question_csv_header=header,
+    )
+    return Prompts(content_expert=prompts.content_expert, shared=shared)
+
+
+def load_csv_header(path: Path) -> list[str]:
+    with path.open(newline="", encoding="utf-8") as csv_file:
+        return next(csv.reader(csv_file))
 
 
 def _load_prompt_group(root: Path, group_type: type):
@@ -60,7 +74,7 @@ def _load_prompt_group(root: Path, group_type: type):
                 prompt_file,
                 encoding="utf-8",
             )
-        else:
+        elif hasattr(field_type, "__dataclass_fields__"):
             group_dir = root / field.name
             values[field.name] = _load_prompt_group(group_dir, field_type)
 
