@@ -32,7 +32,5 @@ Proof
 
 
 ```csv
-Section,Subsection,Question,Answer,Link1,Link2,Link3,Notes
-LangGraph,Graph basics,What is a node in LangGraph?,A function or runnable that receives state and returns a state update.,,,,
-LangGraph,Conditional routing,What does conditional routing choose?,The next node based on the current state.,,,,
+{question_csv_header}
 ```
