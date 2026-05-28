@@ -15,20 +15,10 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 from langgraph.runtime import Runtime
 
-from course_questions_gen.prompts import Prompts
-
-from dataclasses import dataclass
-from langchain_core.language_models.chat_models import BaseChatModel
+from course_questions_gen.utils import GraphContext
 
 
 #============================ Graph States =================================
-
-@dataclass(frozen=True)
-class GraphContext:
-    llm: BaseChatModel
-    prompts: Prompts
-    question_count: int
-
 
 class ExpertDescription(BaseModel): # For LLM output parsing only, not for graph state.
     topic: str = Field(description="Topic name on what expert focused")
@@ -215,10 +205,8 @@ def save_csv(
     state: GeneralState,
     runtime: Runtime[GraphContext],
 ) -> dict[str, Any]:
-    output_path = state.get("output_path")
-    if not output_path:
-        return {}
-
+    output_path = runtime.context.output_path
+    
     fieldnames = runtime.context.prompts.shared.question_csv_header
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
