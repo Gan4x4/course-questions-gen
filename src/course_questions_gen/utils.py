@@ -14,6 +14,7 @@ class GraphContext:
     prompts: Prompts
     question_count: int
     output_path: str
+    topics_path: str = "data/topics.csv"
 
 
 def create_default_context() -> GraphContext:

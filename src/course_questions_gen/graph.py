@@ -187,7 +187,7 @@ def combine_questions(
         raw_questions = expert.get("raw_questions", [])
         for q in raw_questions:
             fq = {
-                "Section": expert["section"],
+                "Section": expert["section"] if not formatted_questions else "",
                 "Subsection": expert["topic"],
                 "Question": q["question"],
                 "Answer": q["answer"],
