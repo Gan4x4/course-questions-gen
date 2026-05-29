@@ -10,12 +10,14 @@ from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import SystemMessage
 
-from langgraph.constants import Send
+
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 from langgraph.runtime import Runtime
 
 from course_questions_gen.utils import GraphContext
+from langgraph.types import Command, Send, interrupt
+from langgraph.checkpoint.memory import InMemorySaver
 
 
 #============================ Graph States =================================
@@ -150,10 +152,12 @@ def generate_questions(state: ExpertState, runtime: Runtime[GraphContext]) -> di
     generate_question_prompt = runtime.context.prompts.content_expert.generate_question
     question_rules_prompt = runtime.context.prompts.shared.question_format.format()
 
+    how_much_question_generate = runtime.context.question_count - len(state.get("raw_questions", []))
+
     # Generate question. Values like `section`, `topic` comes from **state dict.
     prompt_values = {
         **state,
-        "question_count": runtime.context.question_count,
+        "question_count": how_much_question_generate,
         "question_rules": question_rules_prompt,
     }
     system_message = generate_question_prompt.format(**prompt_values)
@@ -169,10 +173,42 @@ def generate_questions(state: ExpertState, runtime: Runtime[GraphContext]) -> di
         "experts": {
             state["topic"]: {
                 **state,
-                "raw_questions": raw_questions,
+                "raw_questions": state.get("raw_questions", []) + raw_questions,
             },
         },
     }
+
+
+
+def human_feedback(state: GeneralState) -> dict[str, Any]:
+    approved_questions = interrupt({
+        "message": "Review these questions.",
+        "experts": state["experts"],
+    })
+
+    updated_experts = {}
+
+    for topic, expert in state["experts"].items():
+        updated_experts[topic] = {
+            **expert,
+            "raw_questions": approved_questions.get(topic, []),
+        }
+
+    return {"experts": updated_experts}
+
+
+def route_missing_questions(state: GeneralState, runtime: Runtime[GraphContext]) -> list[Send] | str:
+    sends = []
+
+    for expert in state.get("experts", {}).values():
+        question_count = len(expert.get("raw_questions", []))
+        if question_count < runtime.context.question_count:
+            sends.append(Send("generate_questions", expert))
+
+    if sends:
+        return sends
+
+    return "combine_questions"
 
 
 def combine_questions(
@@ -201,6 +237,9 @@ def combine_questions(
     return {"formatted_questions": formatted_questions}
 
 
+
+
+
 def save_csv(
     state: GeneralState,
     runtime: Runtime[GraphContext],
@@ -219,13 +258,14 @@ def save_csv(
     return {}
 
 
-def build_graph():
+def build_graph(checkpointer = InMemorySaver()):
     """Build and compile the placeholder question-generation graph."""
     #create_default_context()
     builder = StateGraph(GeneralState, context_schema=GraphContext)
 
     builder.add_node("create_topic_experts", create_topic_experts)
     builder.add_node("generate_questions", generate_questions)
+    builder.add_node("human_feedback", human_feedback)
     builder.add_node("combine_questions", combine_questions)
     builder.add_node("save_csv", save_csv)
 
@@ -236,8 +276,52 @@ def build_graph():
         route_topic_experts,
         ["generate_questions"],
     )
-    builder.add_edge("generate_questions", "combine_questions")
+    # Checking questions
+    builder.add_edge("generate_questions", "human_feedback")
+    builder.add_conditional_edges(
+        "human_feedback",
+        route_missing_questions,
+        ["generate_questions", "combine_questions"],
+    )
     builder.add_edge("combine_questions", "save_csv")
     builder.add_edge("save_csv", END)
 
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
+
+
+def collect_feedback_from_terminal(payload):
+    approved = {}
+
+    for topic, expert in payload["experts"].items():
+        approved[topic] = []
+
+        for question in expert.get("raw_questions", []):
+            print("\nTopic:", topic)
+            print(question["question"])
+
+            answer = input("Keep? [Y/n]: ").strip().lower()
+            if answer not in ("n", "no"):
+                approved[topic].append(question)
+
+    return approved
+
+def run_graph_with_feedback(
+    graph,
+    input_state: GeneralState,
+    context: GraphContext,
+    collect_feedback = collect_feedback_from_terminal,
+):
+    config = {"configurable": {"thread_id": "question-generation"}}
+    result = graph.invoke(input_state, config=config, context=context)
+
+    while "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        feedback = collect_feedback(payload)
+
+        result = graph.invoke(
+            Command(resume=feedback),
+            config=config,
+            context=context,
+        )
+
+    return result
