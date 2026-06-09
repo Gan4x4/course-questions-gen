@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 from course_questions_gen.graph import ExpertsOutput, QuestionsOutput
 from course_questions_gen.prompts import load_prompts
-from course_questions_gen.utils import GraphContext
 
 
 LANGGRAPH_URL = "https://langchain-ai.github.io/langgraph/"
@@ -28,11 +27,14 @@ class StructuredDummyLLM:
 
 
 def fake_context(prompts=None, question_count=2, output_path="output/questions.csv"):
-    return GraphContext(
+    return SimpleNamespace(
         llm=DummyLLM(),
         prompts=prompts or load_prompts(Path("prompts")),
+        model="fake-model",
+        prompts_dir="prompts",
         question_count=question_count,
         output_path=output_path,
+        topics_path="data/topics.csv",
     )
 
 

@@ -1,0 +1,8 @@
+{
+  "$schema": "https://langgra.ph/schema.json",
+  "dependencies": ["."],
+  "graphs": {
+    "course_questions": "./src/course_questions_gen/graph_app.py:graph"
+  },
+  "env": ".env"
+}

@@ -1,17 +1,16 @@
 from configparser import ConfigParser
 from dataclasses import dataclass
 
-from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 
-from course_questions_gen.prompts import Prompts, load_prompts
+from course_questions_gen.prompts import load_prompts
 import pandas as pd
 
 
 @dataclass(frozen=True)
 class GraphContext:
-    llm: BaseChatModel
-    prompts: Prompts
+    model: str
+    prompts_dir: str
     question_count: int
     output_path: str
     topics_path: str = "data/topics.csv"
@@ -21,19 +20,24 @@ def create_default_context() -> GraphContext:
     config = ConfigParser()
     config.read("settings.ini")
 
-    llm = ChatOpenAI(
+    return GraphContext(
         model=config["base"]["model"],
+        prompts_dir=config["base"]["prompts_dir"],
+        question_count=config.getint("extra", "question_count"),
+        output_path=config["extra"]["output_path"],
+        topics_path=config["extra"]["topics_path"],
+    )
+
+
+def create_llm(context: GraphContext):
+    return ChatOpenAI(
+        model=context.model,
         temperature=0,
     )
 
-    prompts = load_prompts(config["base"]["prompts_dir"])
 
-    return GraphContext(
-        llm=llm,
-        prompts=prompts,
-        question_count=config.getint("extra", "question_count"),
-        output_path=config["extra"]["output_path"],
-    )
+def create_prompts(context: GraphContext):
+    return load_prompts(context.prompts_dir)
 
 
 class TopicsCSV(object):
@@ -61,4 +65,3 @@ class TopicsCSV(object):
             topics.append(str(self.df.iloc[index, topics_col]))
             index += 1
         return topics
-

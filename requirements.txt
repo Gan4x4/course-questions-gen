@@ -6,3 +6,4 @@ httpx[socks]
 pydantic>=2.0.0
 ipython>=8.0.0
 pandas
+langgraph-cli[inmem]

@@ -4,6 +4,7 @@ import csv
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from langchain_core.prompts import PromptTemplate
 
@@ -11,6 +12,9 @@ from course_questions_gen.graph import (
     combine_questions,
     create_topic_experts,
     generate_questions,
+    human_feedback,
+    route_topic_experts,
+    route_missing_questions,
     save_csv,
 )
 
@@ -21,6 +25,24 @@ from course_questions_gen.prompts import (
 )
 
 from tests.utils import LANGGRAPH_URL, fake_runtime
+
+
+class RecordingLLM:
+    def __init__(self):
+        self.prompt = ""
+
+    def with_structured_output(self, schema):
+        return RecordingStructuredLLM(self, schema)
+
+
+class RecordingStructuredLLM:
+    def __init__(self, llm, schema):
+        self.llm = llm
+        self.schema = schema
+
+    def invoke(self, messages):
+        self.llm.prompt = messages[0].content
+        return self.schema(questions=[])
 
 
 class GraphNodeTests(unittest.TestCase):
@@ -56,6 +78,10 @@ class GraphNodeTests(unittest.TestCase):
         self.assertTrue(
             all(expert["description"] for expert in result["experts"].values()),
         )
+        for expert in result["experts"].values():
+            self.assertEqual(expert["raw_questions"], [])
+            self.assertEqual(expert["approved_questions"], [])
+            self.assertEqual(expert["rejected_questions"], [])
 
     def test_create_topic_experts_does_not_mutate_state(self) -> None:
         state = {
@@ -68,12 +94,102 @@ class GraphNodeTests(unittest.TestCase):
 
         self.assertEqual(state, original_state)
 
+    def test_create_topic_experts_preserves_existing_questions(self) -> None:
+        approved_question = {
+            "question": "How does StateGraph use state?",
+            "answer": "Nodes return state updates.",
+        }
+        rejected_question = {
+            "question": "What is LangGraph?",
+            "answer": "Too broad.",
+        }
+        state = {
+            "section": "Agents",
+            "topics": ["StateGraph"],
+            "experts": {
+                "StateGraph": {
+                    "approved_questions": [approved_question],
+                    "rejected_questions": [rejected_question],
+                },
+            },
+        }
+
+        result = create_topic_experts(state, self._runtime())
+
+        expert = result["experts"]["StateGraph"]
+        self.assertEqual(expert["approved_questions"], [approved_question])
+        self.assertEqual(expert["rejected_questions"], [rejected_question])
+
+    def test_route_topic_experts_counts_existing_approved_questions(self) -> None:
+        state = {
+            "experts": {
+                "StateGraph": {
+                    "approved_questions": [
+                        {"question": "One?"},
+                    ],
+                },
+                "Send": {
+                    "approved_questions": [
+                        {"question": "One?"},
+                        {"question": "Two?"},
+                    ],
+                },
+            },
+        }
+
+        result = route_topic_experts(state, fake_runtime(question_count=2))
+
+        self.assertIsInstance(result, list)
+        self.assertEqual(len(result), 1)
+
+    def test_route_topic_experts_skips_generation_when_questions_are_complete(self) -> None:
+        state = {
+            "experts": {
+                "StateGraph": {
+                    "approved_questions": [
+                        {"question": "One?"},
+                        {"question": "Two?"},
+                    ],
+                },
+            },
+        }
+
+        result = route_topic_experts(state, fake_runtime(question_count=2))
+
+        self.assertEqual(result, "combine_questions")
+
     def test_generate_questions_uses_expert_state_in_prompt(self) -> None:
         state = {
             "section": "Agents",
             "topic": "StateGraph",
             "description": "Focus on graph state and nodes.",
-            "question_count": 3,
+            "raw_questions": [
+                {
+                    "question": "Old unreviewed question?",
+                    "answer": "Old answer.",
+                    "link1": "",
+                    "link2": "",
+                    "link3": "",
+                },
+            ],
+            "approved_questions": [
+                {
+                    "question": "Approved question?",
+                    "answer": "Approved answer.",
+                    "link1": "",
+                    "link2": "",
+                    "link3": "",
+                },
+            ],
+            "rejected_questions": [
+                {
+                    "question": "Rejected question?",
+                    "answer": "Rejected answer.",
+                    "link1": "",
+                    "link2": "",
+                    "link3": "",
+                },
+            ],
         }
 
         result = generate_questions(state, fake_runtime())
@@ -100,6 +216,147 @@ class GraphNodeTests(unittest.TestCase):
                 },
             ],
         )
+        self.assertEqual(expert["approved_questions"], state["approved_questions"])
+        self.assertEqual(expert["rejected_questions"], state["rejected_questions"])
+
+    def test_generate_questions_sends_approved_question_text_without_answers(self) -> None:
+        llm = RecordingLLM()
+        prompts = Prompts(
+            content_expert=ContentExpertPrompts(
+                create_topic_experts=PromptTemplate.from_template(""),
+                generate_question=PromptTemplate.from_template(
+                    "Topic:\n{topic}\n\nExamples:\n{approved_question_examples}\n",
+                ),
+            ),
+            shared=SharedPrompts(question_format=PromptTemplate.from_template("")),
+        )
+        runtime = fake_runtime(prompts=prompts, question_count=3)
+        runtime.context = runtime.context.__class__(
+            llm=llm,
+            prompts=runtime.context.prompts,
+            question_count=runtime.context.question_count,
+            output_path=runtime.context.output_path,
+        )
+
+        generate_questions(
+            {
+                "section": "Agents",
+                "topic": "StateGraph",
+                "description": "Focus on graph state and nodes.",
+                "approved_questions": [
+                    {
+                        "question": "How should a node update graph state?",
+                        "answer": "It should return a partial state update.",
+                    },
+                    {
+                        "answer": "This has no question and should be skipped.",
+                    },
+                ],
+                "rejected_questions": [],
+            },
+            runtime,
+        )
+
+        self.assertIn("How should a node update graph state?", llm.prompt)
+        self.assertNotIn("It should return a partial state update.", llm.prompt)
+        self.assertNotIn("This has no question and should be skipped.", llm.prompt)
+
+    def test_human_feedback_updates_question_lists(self) -> None:
+        approved_question = {
+            "question": "Already approved?",
+            "answer": "Yes.",
+            "link1": LANGGRAPH_URL,
+            "link2": "",
+            "link3": "",
+        }
+        accepted_question = {
+            "question": "Keep this?",
+            "answer": "Keep.",
+            "link1": LANGGRAPH_URL,
+            "link2": "",
+            "link3": "",
+        }
+        rejected_question = {
+            "question": "Reject this?",
+            "answer": "Reject.",
+            "link1": LANGGRAPH_URL,
+            "link2": "",
+            "link3": "",
+        }
+
+        state = {
+            "experts": {
+                "StateGraph": {
+                    "section": "Agents",
+                    "topic": "StateGraph",
+                    "description": "Focus on graph state.",
+                    "raw_questions": [accepted_question, rejected_question],
+                    "approved_questions": [approved_question],
+                    "rejected_questions": [],
+                },
+            },
+        }
+
+        feedback = {"StateGraph": ["1"]}
+        with patch("course_questions_gen.graph.interrupt", return_value=feedback) as interrupt_mock:
+            result = human_feedback(state)
+
+        payload = interrupt_mock.call_args.args[0]
+        review_questions = payload["topics"]["StateGraph"]
+        self.assertEqual(
+            review_questions,
+            [
+                {
+                    "number": 1,
+                    "question": "Keep this?",
+                    "answer": "Keep.",
+                },
+                {
+                    "number": 2,
+                    "question": "Reject this?",
+                    "answer": "Reject.",
+                },
+            ],
+        )
+        self.assertEqual(payload["resume_format"], {"StateGraph": [1, 2]})
+
+        expert = result["experts"]["StateGraph"]
+        self.assertEqual(expert["raw_questions"], [])
+        self.assertEqual(expert["approved_questions"], [approved_question, accepted_question])
+        self.assertEqual(expert["rejected_questions"], [rejected_question])
+
+    def test_route_missing_questions_counts_approved_questions(self) -> None:
+        result = route_missing_questions(
+            {
+                "experts": {
+                    "StateGraph": {
+                        "approved_questions": [
+                            {"question": "One?"},
+                        ],
+                    },
+                },
+            },
+            fake_runtime(question_count=2),
+        )
+
+        self.assertIsInstance(result, list)
+        self.assertEqual(len(result), 1)
+
+        result = route_missing_questions(
+            {
+                "experts": {
+                    "StateGraph": {
+                        "approved_questions": [
+                            {"question": "One?"},
+                            {"question": "Two?"},
+                        ],
+                    },
+                },
+            },
+            fake_runtime(question_count=2),
+        )
+
+        self.assertEqual(result, "combine_questions")
 
     def test_combine_questions_flattens_expert_questions(self) -> None:
         result = combine_questions(
@@ -108,7 +365,7 @@ class GraphNodeTests(unittest.TestCase):
                     "StateGraph": {
                         "section": "Agents",
                         "topic": "StateGraph",
-                        "raw_questions": [
+                        "approved_questions": [
                             {
                                 "question": "What does a node return?",
                                 "answer": "A state update.",
@@ -178,6 +435,11 @@ class GraphNodeTests(unittest.TestCase):
             "",
             "",
         ])
+
+    def test_graph_app_exposes_compiled_graph(self) -> None:
+        from course_questions_gen.graph_app import graph
+
+        self.assertTrue(hasattr(graph, "invoke"))
 
 
 if __name__ == "__main__":

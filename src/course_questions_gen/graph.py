@@ -15,9 +15,11 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
 from langgraph.runtime import Runtime
 
-from course_questions_gen.utils import GraphContext
+from course_questions_gen.utils import GraphContext, create_llm, create_prompts
 from langgraph.types import Command, Send, interrupt
 from langgraph.checkpoint.memory import InMemorySaver
+
+from course_questions_gen.terminal_feedback import collect_feedback_from_terminal
 
 
 #============================ Graph States =================================
@@ -39,6 +41,8 @@ class ExpertState(TypedDict, total=False):
     description: str # LLM generated
     section: str
     raw_questions: list[dict[str, str]]
+    approved_questions: list[dict[str, str]]
+    rejected_questions: list[dict[str, str]]
 
 class QuestionState(BaseModel):
     question: str = Field(
@@ -79,18 +83,6 @@ def merge_experts(
     return {**current, **updates}
 
 
-def question_csv_row(
-    fieldnames: list[str],
-    section: str,
-    subsection: str,
-    question: str,
-) -> dict[str, str]:
-    row = dict.fromkeys(fieldnames, "")
-    for field, value in zip(fieldnames, [section, subsection, question]):
-        row[field] = value
-    return row
-
-
 class GeneralState(TypedDict, total=False): # total=False for statick checker only
     """State shared by the placeholder graph."""
 
@@ -103,6 +95,20 @@ class GeneralState(TypedDict, total=False): # total=False for statick checker on
 
 # ============================ Graph Nodes =================================
 
+def get_runtime_llm(runtime: Runtime[GraphContext]):
+    llm = getattr(runtime.context, "llm", None)
+    if llm is not None:
+        return llm
+    return create_llm(runtime.context)
+
+
+def get_runtime_prompts(runtime: Runtime[GraphContext]):
+    prompts = getattr(runtime.context, "prompts", None)
+    if prompts is not None:
+        return prompts
+    return create_prompts(runtime.context)
+
+
 def create_topic_experts(
     state: GeneralState,
     runtime: Runtime[GraphContext],
@@ -112,10 +118,11 @@ def create_topic_experts(
     if not topics:
         return {"experts": {}}
 
-    llm = runtime.context.llm
+    llm = get_runtime_llm(runtime)
     structured_llm = llm.with_structured_output(ExpertsOutput)
     topics_text = "\n".join(f"- {topic}" for topic in topics)
-    system_prompt = runtime.context.prompts.content_expert.create_topic_experts
+    prompts = get_runtime_prompts(runtime)
+    system_prompt = prompts.content_expert.create_topic_experts
     section = state.get("section", "")
     system_message = system_prompt.format(
         section=section,
@@ -124,12 +131,16 @@ def create_topic_experts(
     experts_output = structured_llm.invoke([SystemMessage(content=system_message)])
 
     lang_graph_experts = {}
+    current_experts = state.get("experts", {})
     for e in experts_output.descriptions:
+        current_expert = current_experts.get(e.topic, {})
         lang_graph_expert = ExpertState(
             section=section,
             topic=e.topic,
             description=e.description,
-            raw_questions=[],
+            raw_questions=current_expert.get("raw_questions", []),
+            approved_questions=current_expert.get("approved_questions", []),
+            rejected_questions=current_expert.get("rejected_questions", []),
         )
         lang_graph_experts[lang_graph_expert["topic"]] = lang_graph_expert
 
@@ -137,31 +148,57 @@ def create_topic_experts(
 
 
 
-def route_topic_experts(state: GeneralState) -> list[Send]:
+def route_topic_experts(state: GeneralState, runtime: Runtime[GraphContext]) -> list[Send] | str:
     # Parallel question generation
-    return [
-        Send(
-            "generate_questions",
-            expert,
-        )
-        for expert in state.get("experts", {}).values()
-    ]
+    sends = []
+    for expert in state.get("experts", {}).values():
+        question_count = len(expert.get("approved_questions", []))
+        if question_count < runtime.context.question_count:
+            send = Send(
+                "generate_questions",
+                expert,
+            )
+            sends.append(send)
+    if sends:
+        return sends
+    return "combine_questions"
 
 
 def generate_questions(state: ExpertState, runtime: Runtime[GraphContext]) -> dict[str, Any]:
-    generate_question_prompt = runtime.context.prompts.content_expert.generate_question
-    question_rules_prompt = runtime.context.prompts.shared.question_format.format()
+    prompts = get_runtime_prompts(runtime)
+    generate_question_prompt = prompts.content_expert.generate_question
+    question_rules_prompt = prompts.shared.question_format.format()
 
-    how_much_question_generate = runtime.context.question_count - len(state.get("raw_questions", []))
+    approved_questions = state.get("approved_questions", [])
+    how_much_question_generate = runtime.context.question_count - len(approved_questions)
+    if how_much_question_generate <= 0:
+        return {
+            "experts": {
+                state["topic"]: {
+                    **state,
+                    "raw_questions": [],
+                    "approved_questions": approved_questions,
+                },
+            },
+        }
+
+    approved_question_examples = []
+    for question in approved_questions:
+        question_text = question.get("question", "")
+        if question_text:
+            approved_question_examples.append(question_text)
 
     # Generate question. Values like `section`, `topic` comes from **state dict.
     prompt_values = {
         **state,
+        "approved_question_examples": approved_question_examples,
         "question_count": how_much_question_generate,
+        "rejected_questions": state.get("rejected_questions", []),
         "question_rules": question_rules_prompt,
     }
     system_message = generate_question_prompt.format(**prompt_values)
-    structured_llm = runtime.context.llm.with_structured_output(QuestionsOutput)
+    llm = get_runtime_llm(runtime)
+    structured_llm = llm.with_structured_output(QuestionsOutput)
     questions = structured_llm.invoke([SystemMessage(content=system_message)])
         
 
@@ -173,7 +210,8 @@ def generate_questions(state: ExpertState, runtime: Runtime[GraphContext]) -> di
         "experts": {
             state["topic"]: {
                 **state,
-                "raw_questions": state.get("raw_questions", []) + raw_questions,
+                "raw_questions": raw_questions,
+                "approved_questions": approved_questions,
             },
         },
     }
@@ -181,17 +219,50 @@ def generate_questions(state: ExpertState, runtime: Runtime[GraphContext]) -> di
 
 
 def human_feedback(state: GeneralState) -> dict[str, Any]:
-    approved_questions = interrupt({
-        "message": "Review these questions.",
-        "experts": state["experts"],
+    topics_to_review = {}
+    resume_format = {}
+    for topic, expert in state["experts"].items():
+        topics_to_review[topic] = []
+        resume_format[topic] = []
+
+        for number, question in enumerate(expert.get("raw_questions", []), start=1):
+            topics_to_review[topic].append({
+                "number": number,
+                "question": question.get("question", ""),
+                "answer": question.get("answer", ""),
+            })
+            resume_format[topic].append(number)
+
+    approved_numbers = interrupt({
+        "message": "Review generated questions.",
+        "topics": topics_to_review,
+        "resume_format": resume_format,
     })
 
     updated_experts = {}
 
     for topic, expert in state["experts"].items():
+        raw_questions = expert.get("raw_questions", [])
+        topic_approved_numbers = []
+        for number in approved_numbers.get(topic, []):
+            if isinstance(number, int):
+                topic_approved_numbers.append(number)
+            elif isinstance(number, str) and number.isdigit():
+                topic_approved_numbers.append(int(number))
+        topic_rejected_questions = []
+        topic_approved_questions = []
+
+        for number, question in enumerate(raw_questions, start=1):
+            if number in topic_approved_numbers:
+                topic_approved_questions.append(question)
+            else:
+                topic_rejected_questions.append(question)
+
         updated_experts[topic] = {
             **expert,
-            "raw_questions": approved_questions.get(topic, []),
+            "raw_questions": [],
+            "approved_questions": expert.get("approved_questions", []) + topic_approved_questions,
+            "rejected_questions": expert.get("rejected_questions", []) + topic_rejected_questions,
         }
 
     return {"experts": updated_experts}
@@ -201,7 +272,7 @@ def route_missing_questions(state: GeneralState, runtime: Runtime[GraphContext])
     sends = []
 
     for expert in state.get("experts", {}).values():
-        question_count = len(expert.get("raw_questions", []))
+        question_count = len(expert.get("approved_questions", []))
         if question_count < runtime.context.question_count:
             sends.append(Send("generate_questions", expert))
 
@@ -217,26 +288,22 @@ def combine_questions(
 ) -> dict[str, Any]:
 
     formatted_questions = []
-    fieldnames = runtime.context.prompts.shared.question_csv_header
+    prompts = get_runtime_prompts(runtime)
+    fieldnames = prompts.shared.question_csv_header
     experts = state.get("experts", {})
     for expert in experts.values():
-        raw_questions = expert.get("raw_questions", [])
-        for q in raw_questions:
-            fq = {
-                "Section": expert["section"] if not formatted_questions else "",
-                "Subsection": expert["topic"],
-                "Question": q["question"],
-                "Answer": q["answer"],
-                "Link1": q["link1"],
-                "Link2": q["link2"],
-                "Link3": q["link3"],
-                "Notes": "",
+        approved_questions = expert.get("approved_questions", [])
+        for q in approved_questions:
+            row_data = {
+                **q,
+                "section": expert["section"] if not formatted_questions else "",
+                "subsection": expert["topic"],
             }
-            fq = {field: fq[field] for field in fieldnames}
+            fq = {}
+            for field in fieldnames:
+                fq[field] = row_data.get(field.lower(), "")
             formatted_questions.append(fq)
     return {"formatted_questions": formatted_questions}
-
-
 
 
 
@@ -246,7 +313,8 @@ def save_csv(
 ) -> dict[str, Any]:
     output_path = runtime.context.output_path
     
-    fieldnames = runtime.context.prompts.shared.question_csv_header
+    prompts = get_runtime_prompts(runtime)
+    fieldnames = prompts.shared.question_csv_header
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -258,7 +326,7 @@ def save_csv(
     return {}
 
 
-def build_graph(checkpointer = InMemorySaver()):
+def build_graph(checkpointer = None):
     """Build and compile the placeholder question-generation graph."""
     #create_default_context()
     builder = StateGraph(GeneralState, context_schema=GraphContext)
@@ -274,7 +342,7 @@ def build_graph(checkpointer = InMemorySaver()):
     builder.add_conditional_edges(
         "create_topic_experts",
         route_topic_experts,
-        ["generate_questions"],
+        ["generate_questions", "combine_questions"],
     )
     # Checking questions
     builder.add_edge("generate_questions", "human_feedback")
@@ -289,21 +357,9 @@ def build_graph(checkpointer = InMemorySaver()):
     return builder.compile(checkpointer=checkpointer)
 
 
-def collect_feedback_from_terminal(payload):
-    approved = {}
+def build_local_graph():
+    return build_graph(checkpointer=InMemorySaver())
 
-    for topic, expert in payload["experts"].items():
-        approved[topic] = []
-
-        for question in expert.get("raw_questions", []):
-            print("\nTopic:", topic)
-            print(question["question"])
-
-            answer = input("Keep? [Y/n]: ").strip().lower()
-            if answer not in ("n", "no"):
-                approved[topic].append(question)
-
-    return approved
 
 def run_graph_with_feedback(
     graph,
@@ -316,8 +372,11 @@ def run_graph_with_feedback(
 
     while "__interrupt__" in result:
         payload = result["__interrupt__"][0].value
-        feedback = collect_feedback(payload)
+        # Payload contain generated questio and expert info
 
+        feedback = collect_feedback(payload) # return dict with approved questions
+
+        # Resume from interruption line. Can be inside function
         result = graph.invoke(
             Command(resume=feedback),
             config=config,

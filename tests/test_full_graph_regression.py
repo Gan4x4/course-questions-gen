@@ -5,29 +5,39 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from course_questions_gen.graph import build_graph
-from course_questions_gen.utils import create_default_context
-from dataclasses import replace
+from course_questions_gen.graph import build_local_graph, run_graph_with_feedback
 from tests.utils import LANGGRAPH_URL, fake_context
-import pandas as pd
+
+
+def approve_all(payload):
+    approved = {}
+    for topic, questions in payload["topics"].items():
+        approved[topic] = []
+        for question in questions:
+            approved[topic].append(question["number"])
+    return approved
+
 
 class FullGraphRegressionTests(unittest.TestCase):
     def test_full_graph_uses_real_prompts_with_fake_llm(self) -> None:
 
-        context = create_default_context()
-        altered_context = replace(context, llm=fake_context().llm)
-        graph = build_graph()
-        
-        result = graph.invoke({
-                "section": "Agents",
-                "topics": ["StateGraph", "Send"]
-            },
-            context=altered_context)
-        csv_file = altered_context.output_path
-        print(f"CSV file saved to: {csv_file}")
+        with TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "questions.csv"
+            context = fake_context(output_path=str(output_path))
+            graph = build_local_graph()
+            
+            result = run_graph_with_feedback(
+                graph,
+                {
+                    "section": "Agents",
+                    "topics": ["StateGraph", "Send"]
+                },
+                context,
+                collect_feedback=approve_all,
+            )
 
-        with Path(altered_context.output_path).open(newline="", encoding="utf-8") as file:
-            rows = list(csv.DictReader(file))
+            with output_path.open(newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
 
         self.assertEqual(len(result["experts"]), 2)
         self.assertEqual(len(result["formatted_questions"]), 4)

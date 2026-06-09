@@ -3,3 +3,19 @@
 ![Graph structure](graph.png)
 
 This project is a small LangGraph workflow for generating course questions through focused graph nodes. The graph creates specialized content experts, fans out question generation work, then combines and formats the results. Prompts are stored as editable Markdown files so the graph behavior can evolve without burying instructions in code.
+
+## LangGraph Studio
+
+Install the local development server:
+
+```bash
+pip install "langgraph-cli[inmem]"
+```
+
+Set `OPENAI_API_KEY`, `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`, and `LANGSMITH_PROJECT` in `.env`, then run:
+
+```bash
+langgraph dev
+```
+
+The graph is exposed as `course_questions` through `langgraph.json`.
