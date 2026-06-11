@@ -4,6 +4,7 @@ from __future__ import annotations
 
 
 import csv
+import logging
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
 
@@ -19,7 +20,13 @@ from course_questions_gen.utils import GraphContext, create_llm, create_prompts
 from langgraph.types import Command, Send, interrupt
 from langgraph.checkpoint.memory import InMemorySaver
 
-from course_questions_gen.terminal_feedback import collect_feedback_from_terminal
+from course_questions_gen.terminal_feedback import (
+    collect_feedback_from_terminal,
+    normalize_approved_feedback,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 #============================ Graph States =================================
@@ -109,6 +116,10 @@ def get_runtime_prompts(runtime: Runtime[GraphContext]):
     return create_prompts(runtime.context)
 
 
+def get_runtime_model_name(runtime: Runtime[GraphContext]) -> str:
+    return getattr(runtime.context, "model", "unknown")
+
+
 def create_topic_experts(
     state: GeneralState,
     runtime: Runtime[GraphContext],
@@ -128,7 +139,16 @@ def create_topic_experts(
         section=section,
         topics=topics_text,
     )
+    logger.info(
+        "create_topic_experts: invoking model=%s topic_count=%s",
+        get_runtime_model_name(runtime),
+        len(topics),
+    )
     experts_output = structured_llm.invoke([SystemMessage(content=system_message)])
+    logger.info(
+        "create_topic_experts: received expert_count=%s",
+        len(experts_output.descriptions),
+    )
 
     lang_graph_experts = {}
     current_experts = state.get("experts", {})
@@ -199,7 +219,18 @@ def generate_questions(state: ExpertState, runtime: Runtime[GraphContext]) -> di
     system_message = generate_question_prompt.format(**prompt_values)
     llm = get_runtime_llm(runtime)
     structured_llm = llm.with_structured_output(QuestionsOutput)
+    logger.info(
+        "generate_questions: invoking model=%s topic=%s question_count=%s",
+        get_runtime_model_name(runtime),
+        state["topic"],
+        how_much_question_generate,
+    )
     questions = structured_llm.invoke([SystemMessage(content=system_message)])
+    logger.info(
+        "generate_questions: received question_count=%s topic=%s",
+        len(questions.questions),
+        state["topic"],
+    )
         
 
     raw_questions = []
@@ -215,7 +246,6 @@ def generate_questions(state: ExpertState, runtime: Runtime[GraphContext]) -> di
             },
         },
     }
-
 
 
 def human_feedback(state: GeneralState) -> dict[str, Any]:
@@ -238,17 +268,13 @@ def human_feedback(state: GeneralState) -> dict[str, Any]:
         "topics": topics_to_review,
         "resume_format": resume_format,
     })
+    approved_numbers = normalize_approved_feedback(approved_numbers, resume_format)
 
     updated_experts = {}
 
     for topic, expert in state["experts"].items():
         raw_questions = expert.get("raw_questions", [])
-        topic_approved_numbers = []
-        for number in approved_numbers.get(topic, []):
-            if isinstance(number, int):
-                topic_approved_numbers.append(number)
-            elif isinstance(number, str) and number.isdigit():
-                topic_approved_numbers.append(int(number))
+        topic_approved_numbers = approved_numbers.get(topic, [])
         topic_rejected_questions = []
         topic_approved_questions = []
 
@@ -372,7 +398,7 @@ def run_graph_with_feedback(
 
     while "__interrupt__" in result:
         payload = result["__interrupt__"][0].value
-        # Payload contain generated questio and expert info
+        # Payload contain generated question and expert info
 
         feedback = collect_feedback(payload) # return dict with approved questions
 

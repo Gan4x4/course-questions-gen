@@ -58,6 +58,35 @@ class GraphNodeTests(unittest.TestCase):
         )
         return fake_runtime(prompts)
 
+    def _feedback_state(self):
+        return {
+            "experts": {
+                "StateGraph": {
+                    "section": "Agents",
+                    "topic": "StateGraph",
+                    "description": "Focus on graph state.",
+                    "raw_questions": [
+                        {
+                            "question": "Keep this?",
+                            "answer": "Keep.",
+                            "link1": LANGGRAPH_URL,
+                            "link2": "",
+                            "link3": "",
+                        },
+                        {
+                            "question": "Reject this?",
+                            "answer": "Reject.",
+                            "link1": LANGGRAPH_URL,
+                            "link2": "",
+                            "link3": "",
+                        },
+                    ],
+                    "approved_questions": [],
+                    "rejected_questions": [],
+                },
+            },
+        }
+
     def test_create_topic_experts_returns_one_expert_per_topic(self) -> None:
         state = {
             "section": "Большие языковые модели",
@@ -324,6 +353,26 @@ class GraphNodeTests(unittest.TestCase):
         self.assertEqual(expert["raw_questions"], [])
         self.assertEqual(expert["approved_questions"], [approved_question, accepted_question])
         self.assertEqual(expert["rejected_questions"], [rejected_question])
+
+    def test_human_feedback_accepts_single_topic_number_list(self) -> None:
+        with patch("course_questions_gen.graph.interrupt", return_value=[1]):
+            result = human_feedback(self._feedback_state())
+
+        expert = result["experts"]["StateGraph"]
+        self.assertEqual(len(expert["approved_questions"]), 1)
+        self.assertEqual(expert["approved_questions"][0]["question"], "Keep this?")
+        self.assertEqual(len(expert["rejected_questions"]), 1)
+
+    def test_human_feedback_accepts_wrapped_approved_numbers(self) -> None:
+        feedback = {"approved_numbers": {"StateGraph": "1"}}
+
+        with patch("course_questions_gen.graph.interrupt", return_value=feedback):
+            result = human_feedback(self._feedback_state())
+
+        expert = result["experts"]["StateGraph"]
+        self.assertEqual(len(expert["approved_questions"]), 1)
+        self.assertEqual(expert["approved_questions"][0]["question"], "Keep this?")
+        self.assertEqual(len(expert["rejected_questions"]), 1)
 
     def test_route_missing_questions_counts_approved_questions(self) -> None:
         result = route_missing_questions(

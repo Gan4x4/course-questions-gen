@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from course_questions_gen.terminal_feedback import (
     collect_feedback_from_terminal,
+    normalize_approved_feedback,
     select_questions,
 )
 
@@ -62,6 +63,28 @@ class TerminalFeedbackTests(unittest.TestCase):
         self.assertIn("Answer: A state update.", output.getvalue())
         self.assertIn("What does Send do?", output.getvalue())
         self.assertIn("Answer: It fans out work.", output.getvalue())
+
+    def test_normalize_approved_feedback_accepts_single_topic_list(self) -> None:
+        resume_format = {"StateGraph": [1, 2, 3]}
+
+        approved = normalize_approved_feedback([1, "3"], resume_format)
+
+        self.assertEqual(approved, {"StateGraph": [1, 3]})
+
+    def test_normalize_approved_feedback_accepts_wrapped_feedback(self) -> None:
+        resume_format = {"StateGraph": [1, 2, 3]}
+        feedback = {"approved_numbers": {"StateGraph": "1, 3"}}
+
+        approved = normalize_approved_feedback(feedback, resume_format)
+
+        self.assertEqual(approved, {"StateGraph": [1, 3]})
+
+    def test_normalize_approved_feedback_rejects_out_of_range_numbers(self) -> None:
+        resume_format = {"StateGraph": [1, 2]}
+
+        approved = normalize_approved_feedback({"StateGraph": [1, 3]}, resume_format)
+
+        self.assertEqual(approved, {"StateGraph": [1]})
 
 
 if __name__ == "__main__":
